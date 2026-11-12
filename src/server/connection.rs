@@ -2264,7 +2264,11 @@ impl Connection {
             self.services_subed = true;
             if let Some(s) = self.server.upgrade() {
                 let mut noperms = Vec::new();
-                if !self.peer_keyboard_enabled() && !self.show_remote_cursor {
+                // [rd-sharp] 只读模式下仍应能看到对端光标，否则「只读」会失去意义。
+                if !self.peer_keyboard_enabled()
+                    && !self.show_remote_cursor
+                    && !session_policy::view_only()
+                {
                     noperms.push(NAME_CURSOR);
                 }
                 if !self.show_remote_cursor {
@@ -2342,11 +2346,13 @@ impl Connection {
     }
 
     fn peer_keyboard_enabled(&self) -> bool {
-        self.keyboard && !self.disable_keyboard
+        // [rd-sharp] 追加被控端策略锁：只在被控端开启「只读」时生效，
+        // 主控端的 view-only 开关无法覆盖这里的判定。
+        self.keyboard && !self.disable_keyboard && !session_policy::view_only()
     }
 
     fn clipboard_enabled(&self) -> bool {
-        self.clipboard && !self.disable_clipboard
+        self.clipboard && !self.disable_clipboard && !session_policy::clipboard_locked()
     }
 
     #[inline]
@@ -2357,12 +2363,12 @@ impl Connection {
     }
 
     fn audio_enabled(&self) -> bool {
-        self.audio && !self.disable_audio
+        self.audio && !self.disable_audio && !session_policy::audio_locked()
     }
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     fn file_transfer_enabled(&self) -> bool {
-        self.file && self.enable_file_transfer
+        self.file && self.enable_file_transfer && !session_policy::file_transfer_locked()
     }
 
     #[cfg(feature = "unix-file-copy-paste")]
@@ -4964,7 +4970,10 @@ impl Connection {
                     s.write().unwrap().subscribe(
                         NAME_CURSOR,
                         self.inner.clone(),
-                        self.peer_keyboard_enabled() || self.show_remote_cursor,
+                        // [rd-sharp] 只读模式保留光标订阅
+                        self.peer_keyboard_enabled()
+                            || self.show_remote_cursor
+                            || session_policy::view_only(),
                     );
                     s.write().unwrap().subscribe(
                         NAME_POS,
@@ -5066,7 +5075,10 @@ impl Connection {
                     s.write().unwrap().subscribe(
                         NAME_CURSOR,
                         self.inner.clone(),
-                        self.peer_keyboard_enabled() || self.show_remote_cursor,
+                        // [rd-sharp] 只读模式保留光标订阅
+                        self.peer_keyboard_enabled()
+                            || self.show_remote_cursor
+                            || session_policy::view_only(),
                     );
                 }
             }
