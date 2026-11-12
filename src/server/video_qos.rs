@@ -305,7 +305,7 @@ impl Default for VideoQoS {
     fn default() -> Self {
         VideoQoS {
             fps: FPS,
-            ratio: BR_BALANCED,
+            ratio: BR_BEST, // [rd-sharp] was BR_BALANCED：会话初始码率即按「最佳」起算
             users: Default::default(),
             displays: Default::default(),
             bitrate_store: 0,
@@ -681,37 +681,18 @@ impl VideoQoS {
             .filter(|q| *q != None)
             .max_by(|a, b| a.unwrap_or_default().0.cmp(&b.unwrap_or_default().0))
             .flatten()
-            .unwrap_or((0, Quality::Balanced))
+            .unwrap_or((0, Quality::default()))
             .1
     }
 
-    // Lowest ratio the latest quality allows: keeps about 1Mbps at high resolutions.
+    // [rd-sharp] 画质地板。原实现把「最佳」下限压到 BR_BEST / 2.5，
+    // 1080p 下约 1.2 Mbps —— 网络稍有波动画面直接被拉糊，而且回不来。
+    // 改为比例型地板：Best 不低于目标码率的 60%，Balanced 不低于 55%。
+    // 想彻底锁定码率，另可设置 enable-abr=N。
     fn min_ratio(&self) -> f32 {
-        let current_bitrate = self.bitrate();
-        let ratio_1mbps = if current_bitrate > 0 {
-            Some((self.ratio * 1000.0 / current_bitrate as f32).max(BR_MIN_HIGH_RESOLUTION))
-        } else {
-            None
-        };
         match self.latest_quality() {
-            Quality::Best => {
-                let mut min = BR_BEST / 2.5;
-                if let Some(ratio_1mbps) = ratio_1mbps {
-                    if min > ratio_1mbps {
-                        min = ratio_1mbps;
-                    }
-                }
-                min.max(BR_MIN)
-            }
-            Quality::Balanced => {
-                let mut min = (BR_BALANCED / 2.0).min(0.4);
-                if let Some(ratio_1mbps) = ratio_1mbps {
-                    if min > ratio_1mbps {
-                        min = ratio_1mbps;
-                    }
-                }
-                min.max(BR_MIN_HIGH_RESOLUTION)
-            }
+            Quality::Best => (BR_BEST * 0.6).max(BR_MIN),
+            Quality::Balanced => (BR_BALANCED * 0.55).max(BR_MIN_HIGH_RESOLUTION),
             Quality::Low | Quality::Custom(_) => BR_MIN_HIGH_RESOLUTION,
         }
     }
