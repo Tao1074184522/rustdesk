@@ -838,10 +838,33 @@ impl Decoder {
         } else {
             PreferCodec::Auto
         };
-        let chroma = if options.get("i444") == Some(&"Y".to_string()) {
-            Chroma::I444
+        // [rd-sharp] 色度采样：桌面端默认请求 4:4:4（文字无彩边），移动端保持 4:2:0（省电）。
+        // 显式配置为 i444=Y / i444=N 时，以配置为准。
+        let chroma = match options.get("i444").map(|v| v.as_str()) {
+            Some("Y") => Chroma::I444,
+            Some("N") => Chroma::I420,
+            _ => {
+                if cfg!(any(target_os = "android", target_os = "ios")) {
+                    Chroma::I420
+                } else {
+                    Chroma::I444
+                }
+            }
+        };
+        // [rd-sharp] 4:4:4 只有软件 AV1 / VP9 支持，硬件编码器（NVENC/QSV/AMF/VideoToolbox）
+        // 在 use_i444() 里一律返回 false，会静默退回 4:2:0。
+        // 因此请求 4:4:4 且编码器为自动档时，收敛到支持 4:4:4 的软件编码器。
+        // AV1 优先：RustDesk 的 AV1 编码器已开启 AOM_CONTENT_SCREEN（调色板 + 帧内块复制），
+        // 屏幕内容压缩效率明显优于 VP9 路径。若本机 AV1 基准测试判定过慢，则退回 VP9。
+        let codec = if codec == PreferCodec::Auto && chroma == Chroma::I444 {
+            use base::config::keys::OPTION_AV1_TEST;
+            if Config::get_option(OPTION_AV1_TEST) == "N" {
+                PreferCodec::VP9
+            } else {
+                PreferCodec::AV1
+            }
         } else {
-            Chroma::I420
+            codec
         };
         (codec, chroma)
     }
@@ -890,8 +913,12 @@ pub fn allow_d3d_render() -> bool {
     option2bool(OPTION, &hbb_common::config::LocalConfig::get_option(OPTION))
 }
 
-pub const BR_BEST: f32 = 1.5;
-pub const BR_BALANCED: f32 = 0.67;
+// [rd-sharp v2] 画质优先改造：原始值为 1.5 / 0.67 / 0.5。
+// 「最佳」档 2.6：1080p 约 7.8 Mbps，4K 约 23 Mbps。
+// 配合 aom.rs 收紧的量化上限，这部分码率真正换成清晰度，不是喂给填充。
+// 上行只有 20 Mbps 左右时，改用「均衡」档或关掉 enable-abr。
+pub const BR_BEST: f32 = 2.6;
+pub const BR_BALANCED: f32 = 0.9;
 pub const BR_SPEED: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -904,7 +931,8 @@ pub enum Quality {
 
 impl Default for Quality {
     fn default() -> Self {
-        Self::Balanced
+        // [rd-sharp] 默认使用「最佳」，避免装好就被「均衡」压到 2 Mbps 以下。
+        Self::Best
     }
 }
 
@@ -928,19 +956,19 @@ impl Quality {
 
 pub fn base_bitrate(width: u32, height: u32) -> u32 {
     const RESOLUTION_PRESETS: &[(u32, u32, u32)] = &[
-        (640, 480, 400),     // VGA, 307k pixels
-        (800, 600, 500),     // SVGA, 480k pixels
-        (1024, 768, 800),    // XGA, 786k pixels
-        (1280, 720, 1000),   // 720p, 921k pixels
-        (1366, 768, 1100),   // HD, 1049k pixels
-        (1440, 900, 1300),   // WXGA+, 1296k pixels
-        (1600, 900, 1500),   // HD+, 1440k pixels
-        (1920, 1080, 2073),  // 1080p, 2073k pixels
-        (2048, 1080, 2200),  // 2K DCI, 2211k pixels
-        (2560, 1440, 3000),  // 2K QHD, 3686k pixels
-        (3440, 1440, 4000),  // UWQHD, 4953k pixels
-        (3840, 2160, 5000),  // 4K UHD, 8294k pixels
-        (7680, 4320, 12000), // 8K UHD, 33177k pixels
+        (640, 480, 500),      // VGA, 307k pixels
+        (800, 600, 700),      // SVGA, 480k pixels
+        (1024, 768, 1100),    // XGA, 786k pixels
+        (1280, 720, 1400),    // 720p, 921k pixels
+        (1366, 768, 1500),    // HD, 1049k pixels
+        (1440, 900, 1900),    // WXGA+, 1296k pixels
+        (1600, 900, 2100),    // HD+, 1440k pixels
+        (1920, 1080, 3000),   // 1080p, 2073k pixels  [rd-sharp] was 2073
+        (2048, 1080, 3200),   // 2K DCI, 2211k pixels  [rd-sharp] was 2200
+        (2560, 1440, 4500),   // 2K QHD, 3686k pixels  [rd-sharp] was 3000
+        (3440, 1440, 5500),   // UWQHD, 4953k pixels   [rd-sharp] was 4000
+        (3840, 2160, 9000),   // 4K UHD, 8294k pixels  [rd-sharp v2] 7500 -> 9000
+        (7680, 4320, 15000),  // 8K UHD, 33177k pixels [rd-sharp] was 12000
     ];
     let pixels = width * height;
 
@@ -954,7 +982,7 @@ pub fn base_bitrate(width: u32, height: u32) -> u32 {
                 pixels - preset_pixels
             }
         })
-        .unwrap_or(((1920 * 1080) as u32, &2073)); // default 1080p
+        .unwrap_or(((1920 * 1080) as u32, &3000)); // default 1080p [rd-sharp] was 2073
 
     let bitrate = (*preset_bitrate as f32 * (pixels as f32 / preset_pixels as f32)).round() as u32;
 
