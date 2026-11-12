@@ -351,22 +351,51 @@ impl AomEncoder {
         (bitrate * ratio) as u32
     }
 
+    /// [rd-sharp v2] 量化区间：从「够用」改为「清晰优先」。
+    ///
+    /// 官方实现把 ratio 截断在 2.0，也就是说无论码率调到多高，量化区间永远停在
+    /// [5, 25]。q_max = 25 就是「文字发虚」的真正上限：画面一复杂（滚动、暗色终端、
+    /// 抗锯齿字体、半透明毛玻璃），编码器立刻顶到 q_max，此时多余的码率换不回清晰度，
+    /// 只会被浪费掉。这就是「加带宽不提清晰度」的原因。
+    ///
+    /// 新实现让 ratio 超过 2.0 后继续收紧量化区间：
+    ///   ratio 2.0 -> q [5, 25]   与官方一致，低带宽场景行为不变
+    ///   ratio 3.0 -> q [3, 21]
+    ///   ratio 5.1 -> q [1, 14]   自定义画质 255 档
+    /// q_min 允许降到 1，静态界面可以做到像素级一致；q_max 降到 14，
+    /// 复杂画面也不会崩到肉眼可见的糊。
     #[inline]
     fn calc_q_values(ratio: f32) -> (u32, u32) {
-        let b = (ratio * 100.0) as u32;
-        let b = std::cmp::min(b, 200);
-        let q_min1 = 24;
-        let q_min2 = 5;
-        let q_max1 = 45;
-        let q_max2 = 25;
+        // 自定义画质 q=255 时倍率为 255 * 2 / 100 = 5.1
+        const BR_ULTRA: f32 = 5.1;
+        const Q_MIN_LOW: f32 = 24.0;
+        const Q_MIN_HIGH: f32 = 5.0;
+        const Q_MAX_LOW: f32 = 45.0;
+        const Q_MAX_HIGH: f32 = 25.0;
+        // [rd-sharp] 超高倍率下的量化下限/上限
+        const Q_MIN_ULTRA: f32 = 1.0;
+        const Q_MAX_ULTRA: f32 = 14.0;
 
-        let t = b as f32 / 200.0;
+        let ratio = ratio.max(0.0);
+        // 第一段 0.0 ~ 2.0：完全沿用官方曲线，保证低带宽下的行为不变
+        let t1 = ratio.min(2.0) / 2.0;
+        let mut q_min = (1.0 - t1) * Q_MIN_LOW + t1 * Q_MIN_HIGH;
+        let mut q_max = (1.0 - t1) * Q_MAX_LOW + t1 * Q_MAX_HIGH;
 
-        let mut q_min: u32 = ((1.0 - t) * q_min1 as f32 + t * q_min2 as f32).round() as u32;
-        let mut q_max = ((1.0 - t) * q_max1 as f32 + t * q_max2 as f32).round() as u32;
+        // 第二段 2.0 ~ 5.1：继续把量化上限压下去，让高码率真正换成清晰度
+        if ratio > 2.0 {
+            let t2 = ((ratio - 2.0) / (BR_ULTRA - 2.0)).clamp(0.0, 1.0);
+            q_min += t2 * (Q_MIN_ULTRA - Q_MIN_HIGH);
+            q_max += t2 * (Q_MAX_ULTRA - Q_MAX_HIGH);
+        }
 
-        q_min = q_min.clamp(q_min2, q_min1);
-        q_max = q_max.clamp(q_max2, q_max1);
+        let mut q_min = (q_min.round() as u32).clamp(1, Q_MIN_LOW as u32);
+        let mut q_max = (q_max.round() as u32).clamp(1, Q_MAX_LOW as u32);
+        // libaom 要求 rc_min_quantizer <= rc_max_quantizer，否则编码器初始化失败
+        if q_max <= q_min {
+            q_max = q_min + 1;
+        }
+        q_min = q_min.min(q_max);
 
         (q_min, q_max)
     }
