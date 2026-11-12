@@ -327,22 +327,33 @@ impl VpxEncoder {
         (bitrate * ratio) as u32
     }
 
+    /// [rd-sharp v2] 与 aom.rs 保持一致：ratio 超过 2.0 后继续收紧量化上限。
+    /// 仅在 AV1 基准测试被判过慢、退回 VP9 时生效，保证两条清晰通道行为一致。
     #[inline]
     fn calc_q_values(ratio: f32) -> (u32, u32) {
-        let b = (ratio * 100.0) as u32;
-        let b = std::cmp::min(b, 200);
-        let q_min1 = 36;
-        let q_min2 = 0;
-        let q_max1 = 56;
-        let q_max2 = 37;
+        const BR_ULTRA: f32 = 5.1;
+        const Q_MIN_LOW: f32 = 36.0;
+        const Q_MIN_HIGH: f32 = 0.0;
+        const Q_MAX_LOW: f32 = 56.0;
+        const Q_MAX_HIGH: f32 = 37.0;
+        // VP9 没有调色板/帧内块复制，量化上限压到 30 已接近其收益极限
+        const Q_MAX_ULTRA: f32 = 30.0;
 
-        let t = b as f32 / 200.0;
+        let ratio = ratio.max(0.0);
+        let t1 = ratio.min(2.0) / 2.0;
+        let q_min = (1.0 - t1) * Q_MIN_LOW + t1 * Q_MIN_HIGH;
+        let mut q_max = (1.0 - t1) * Q_MAX_LOW + t1 * Q_MAX_HIGH;
 
-        let mut q_min: u32 = ((1.0 - t) * q_min1 as f32 + t * q_min2 as f32).round() as u32;
-        let mut q_max = ((1.0 - t) * q_max1 as f32 + t * q_max2 as f32).round() as u32;
+        if ratio > 2.0 {
+            let t2 = ((ratio - 2.0) / (BR_ULTRA - 2.0)).clamp(0.0, 1.0);
+            q_max += t2 * (Q_MAX_ULTRA - Q_MAX_HIGH);
+        }
 
-        q_min = q_min.clamp(q_min2, q_min1);
-        q_max = q_max.clamp(q_max2, q_max1);
+        let q_min = (q_min.round() as u32).clamp(0, Q_MIN_LOW as u32);
+        let mut q_max = (q_max.round() as u32).clamp(0, Q_MAX_LOW as u32);
+        if q_max <= q_min {
+            q_max = q_min + 1;
+        }
 
         (q_min, q_max)
     }
